@@ -382,41 +382,52 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
+
+      // Drain local buffer (messages already consumed by auto-poll)
+      const buffered = drainPendingMessages();
+
+      // Also check broker for any messages the poll loop hasn't picked up yet
       try {
         const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-        if (result.messages.length === 0) {
-          return {
-            content: [{ type: "text" as const, text: "No new messages." }],
-          };
+        for (const m of result.messages) {
+          buffered.push({ ...m, from_summary: "", from_cwd: "" });
         }
-        const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
-        );
+      } catch {
+        // Non-critical — we still have buffered messages
+      }
+
+      if (buffered.length === 0) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
-            },
-          ],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
+          content: [{ type: "text" as const, text: "No new messages." }],
         };
       }
+      const lines = buffered.map(
+        (m) => {
+          const parts = [`From ${m.from_id} (${m.sent_at})`];
+          if (m.from_cwd) parts.push(`CWD: ${m.from_cwd}`);
+          if (m.from_summary) parts.push(`Summary: ${m.from_summary}`);
+          parts.push(m.text);
+          return parts.join("\n");
+        }
+      );
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `${buffered.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
+          },
+        ],
+      };
     }
 
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
 });
+
+// --- Local message buffer (fallback when channel push fails) ---
+
+const pendingMessages: Array<Message & { from_summary: string; from_cwd: string }> = [];
 
 // --- Polling loop for inbound messages ---
 
@@ -427,7 +438,6 @@ async function pollAndPushMessages() {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
 
     for (const msg of result.messages) {
-      // Look up the sender's info for context
       let fromSummary = "";
       let fromCwd = "";
       try {
@@ -442,29 +452,40 @@ async function pollAndPushMessages() {
           fromCwd = sender.cwd;
         }
       } catch {
-        // Non-critical, proceed without sender info
+        // Non-critical
       }
 
-      // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
+      // Try channel push; if it fails, buffer locally for check_messages
+      let channelPushed = false;
+      try {
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              from_summary: fromSummary,
+              from_cwd: fromCwd,
+              sent_at: msg.sent_at,
+            },
           },
-        },
-      });
+        });
+        channelPushed = true;
+        log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+      } catch {
+        log(`Channel push failed for message from ${msg.from_id}, buffering locally`);
+      }
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+      // Always buffer — check_messages can retrieve even if channel worked
+      pendingMessages.push({ ...msg, from_summary: fromSummary, from_cwd: fromCwd });
     }
   } catch (e) {
-    // Broker might be down temporarily, don't crash
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
   }
+}
+
+function drainPendingMessages(): Array<Message & { from_summary: string; from_cwd: string }> {
+  return pendingMessages.splice(0, pendingMessages.length);
 }
 
 // --- Startup ---
