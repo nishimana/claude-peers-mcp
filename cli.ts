@@ -54,7 +54,7 @@ switch (cmd) {
           }>
         >("/list-peers", {
           scope: "machine",
-          cwd: "/",
+          cwd: process.cwd(),
           git_root: null,
         });
 
@@ -86,7 +86,7 @@ switch (cmd) {
         }>
       >("/list-peers", {
         scope: "machine",
-        cwd: "/",
+        cwd: process.cwd(),
         git_root: null,
       });
 
@@ -133,17 +133,41 @@ switch (cmd) {
     try {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
       console.log(`Broker has ${health.peers} peer(s). Shutting down...`);
-      // Find and kill the broker process on the port
-      const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
-      const pids = new TextDecoder()
-        .decode(proc.stdout)
-        .trim()
-        .split("\n")
-        .filter((p) => p);
-      for (const pid of pids) {
-        process.kill(parseInt(pid), "SIGTERM");
+
+      // Prefer graceful shutdown via HTTP endpoint
+      try {
+        await brokerFetch("/shutdown", {});
+        console.log("Broker stopped (graceful).");
+        break;
+      } catch {
+        console.log("Graceful shutdown failed, falling back to process kill...");
       }
-      console.log("Broker stopped.");
+
+      // Fallback: force kill
+      if (process.platform === "win32") {
+        const proc = Bun.spawnSync(["cmd", "/c", `netstat -ano | findstr :${BROKER_PORT} | findstr LISTENING`]);
+        const lines = new TextDecoder().decode(proc.stdout).trim().split("\n").filter((l) => l);
+        const pids = [...new Set(
+          lines.map((line) => {
+            const parts = line.trim().split(/\s+/);
+            return parts[parts.length - 1];
+          }).filter((pid) => pid && /^\d+$/.test(pid))
+        )];
+        for (const pid of pids) {
+          Bun.spawnSync(["taskkill", "/PID", pid, "/F"]);
+        }
+      } else {
+        const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
+        const pids = new TextDecoder()
+          .decode(proc.stdout)
+          .trim()
+          .split("\n")
+          .filter((p) => p);
+        for (const pid of pids) {
+          process.kill(parseInt(pid), "SIGTERM");
+        }
+      }
+      console.log("Broker stopped (forced).");
     } catch {
       console.log("Broker is not running.");
     }

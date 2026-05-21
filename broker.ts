@@ -24,7 +24,7 @@ import type {
 } from "./shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME ?? process.env.USERPROFILE}/.claude-peers.db`;
 
 // --- Database setup ---
 
@@ -59,14 +59,19 @@ db.run(`
 `);
 
 // Clean up stale peers (PIDs that no longer exist) on startup
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function cleanStalePeers() {
   const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
   for (const peer of peers) {
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
+    if (!isProcessAlive(peer.pid)) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
     }
@@ -186,14 +191,11 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 
   // Verify each peer's process is still alive
   return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
+    if (isProcessAlive(p.pid)) {
       return true;
-    } catch {
-      // Clean up dead peer
-      deletePeer.run(p.id);
-      return false;
     }
+    deletePeer.run(p.id);
+    return false;
   });
 }
 
@@ -223,9 +225,31 @@ function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
 
+// --- Graceful shutdown ---
+
+function gracefulShutdown() {
+  console.error("[claude-peers broker] shutting down...");
+  try {
+    db.run("DELETE FROM peers");
+    db.run("DELETE FROM messages WHERE delivered = 0");
+    db.close();
+  } catch {
+    // best effort
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", gracefulShutdown);
+process.on("SIGTERM", gracefulShutdown);
+if (process.platform === "win32") {
+  process.on("exit", () => {
+    try { db.close(); } catch { /* best effort */ }
+  });
+}
+
 // --- HTTP Server ---
 
-Bun.serve({
+const server = Bun.serve({
   port: PORT,
   hostname: "127.0.0.1",
   async fetch(req) {
@@ -260,6 +284,9 @@ Bun.serve({
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
+        case "/shutdown":
+          setTimeout(gracefulShutdown, 100);
+          return Response.json({ ok: true, message: "shutting down" });
         default:
           return Response.json({ error: "not found" }, { status: 404 });
       }

@@ -38,7 +38,14 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+const BROKER_SCRIPT = (() => {
+  const raw = new URL("./broker.ts", import.meta.url).pathname;
+  // On Windows, pathname returns "/C:/path/..." — strip the leading slash
+  if (process.platform === "win32" && raw.match(/^\/[A-Za-z]:\//)) {
+    return raw.slice(1);
+  }
+  return raw;
+})();
 
 // --- Broker communication ---
 
@@ -98,6 +105,18 @@ function log(msg: string) {
   console.error(`[claude-peers] ${msg}`);
 }
 
+function normalizePathForPlatform(p: string): string {
+  if (process.platform === "win32") {
+    // Git on Windows may return MSYS paths like /c/Users/... — convert to C:\Users\...
+    const msys = p.match(/^\/([a-zA-Z])\/(.*)/);
+    if (msys) {
+      return `${msys[1].toUpperCase()}:\\${msys[2].replace(/\//g, "\\")}`;
+    }
+    return p.replace(/\//g, "\\");
+  }
+  return p;
+}
+
 async function getGitRoot(cwd: string): Promise<string | null> {
   try {
     const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
@@ -108,7 +127,7 @@ async function getGitRoot(cwd: string): Promise<string | null> {
     const text = await new Response(proc.stdout).text();
     const code = await proc.exited;
     if (code === 0) {
-      return text.trim();
+      return normalizePathForPlatform(text.trim());
     }
   } catch {
     // not a git repo
@@ -117,8 +136,10 @@ async function getGitRoot(cwd: string): Promise<string | null> {
 }
 
 function getTty(): string | null {
+  if (process.platform === "win32") {
+    return null;
+  }
   try {
-    // Try to get the parent's tty from the process tree
     const ppid = process.ppid;
     if (ppid) {
       const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]);
@@ -547,6 +568,9 @@ async function main() {
 
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
+  if (process.platform === "win32") {
+    process.on("exit", cleanup);
+  }
 }
 
 main().catch((e) => {
