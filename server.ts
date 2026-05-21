@@ -78,10 +78,8 @@ async function ensureBroker(): Promise<void> {
   }
 
   log("Starting broker daemon...");
-  const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
+  const proc = Bun.spawn([process.execPath, BROKER_SCRIPT], {
     stdio: ["ignore", "ignore", "inherit"],
-    // Detach so the broker survives if this MCP server exits
-    // On macOS/Linux, the broker will keep running
   });
 
   // Unref so this process can exit without waiting for the broker
@@ -472,105 +470,117 @@ async function pollAndPushMessages() {
 // --- Startup ---
 
 async function main() {
-  // 1. Ensure broker is running
-  await ensureBroker();
+  // 1. Connect MCP over stdio FIRST — don't let broker/summary block the handshake
+  await mcp.connect(new StdioServerTransport());
+  log("MCP connected");
 
-  // 2. Gather context
-  myCwd = process.cwd();
-  myGitRoot = await getGitRoot(myCwd);
-  const tty = getTty();
+  // 2. Everything else runs in the background after the connection is established
+  const backgroundInit = async () => {
+    await ensureBroker();
 
-  log(`CWD: ${myCwd}`);
-  log(`Git root: ${myGitRoot ?? "(none)"}`);
-  log(`TTY: ${tty ?? "(unknown)"}`);
+    myCwd = process.cwd();
+    myGitRoot = await getGitRoot(myCwd);
+    const tty = getTty();
 
-  // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
-  let initialSummary = "";
-  const summaryPromise = (async () => {
-    try {
-      const branch = await getGitBranch(myCwd);
-      const recentFiles = await getRecentFiles(myCwd);
-      const summary = await generateSummary({
-        cwd: myCwd,
-        git_root: myGitRoot,
-        git_branch: branch,
-        recent_files: recentFiles,
-      });
-      if (summary) {
-        initialSummary = summary;
-        log(`Auto-summary: ${summary}`);
+    log(`CWD: ${myCwd}`);
+    log(`Git root: ${myGitRoot ?? "(none)"}`);
+    log(`TTY: ${tty ?? "(unknown)"}`);
+
+    // Generate initial summary (non-blocking, best-effort)
+    let initialSummary = "";
+    const summaryPromise = (async () => {
+      try {
+        const branch = await getGitBranch(myCwd);
+        const recentFiles = await getRecentFiles(myCwd);
+        const summary = await generateSummary({
+          cwd: myCwd,
+          git_root: myGitRoot,
+          git_branch: branch,
+          recent_files: recentFiles,
+        });
+        if (summary) {
+          initialSummary = summary;
+          log(`Auto-summary: ${summary}`);
+        }
+      } catch (e) {
+        log(`Auto-summary failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
       }
-    } catch (e) {
-      log(`Auto-summary failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
+    })();
+
+    await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
+
+    // Register with broker
+    const reg = await brokerFetch<RegisterResponse>("/register", {
+      pid: process.pid,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      tty,
+      summary: initialSummary,
+    });
+    myId = reg.id;
+    log(`Registered as peer ${myId}`);
+
+    if (!initialSummary) {
+      summaryPromise.then(async () => {
+        if (initialSummary && myId) {
+          try {
+            await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
+            log(`Late auto-summary applied: ${initialSummary}`);
+          } catch {
+            // Non-critical
+          }
+        }
+      });
     }
-  })();
 
-  // Wait briefly for summary, but don't block startup
-  await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
+    // Start polling for inbound messages
+    pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 4. Register with broker
-  const reg = await brokerFetch<RegisterResponse>("/register", {
-    pid: process.pid,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty,
-    summary: initialSummary,
-  });
-  myId = reg.id;
-  log(`Registered as peer ${myId}`);
-
-  // If summary generation is still running, update it when done
-  if (!initialSummary) {
-    summaryPromise.then(async () => {
-      if (initialSummary && myId) {
+    // Start heartbeat
+    heartbeatTimer = setInterval(async () => {
+      if (myId) {
         try {
-          await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
-          log(`Late auto-summary applied: ${initialSummary}`);
+          await brokerFetch("/heartbeat", { id: myId });
         } catch {
           // Non-critical
         }
       }
-    });
-  }
+    }, HEARTBEAT_INTERVAL_MS);
+  };
 
-  // 5. Connect MCP over stdio
-  await mcp.connect(new StdioServerTransport());
-  log("MCP connected");
+  // 3. Timers — declared here so cleanup can reference them
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
-  // 6. Start polling for inbound messages
-  const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
-
-  // 7. Start heartbeat
-  const heartbeatTimer = setInterval(async () => {
+  // 4. Clean up on exit (synchronous-safe for Windows "exit" event)
+  const cleanup = () => {
+    if (pollTimer) clearInterval(pollTimer);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (myId) {
       try {
-        await brokerFetch("/heartbeat", { id: myId });
-      } catch {
-        // Non-critical
-      }
-    }
-  }, HEARTBEAT_INTERVAL_MS);
-
-  // 8. Clean up on exit
-  const cleanup = async () => {
-    clearInterval(pollTimer);
-    clearInterval(heartbeatTimer);
-    if (myId) {
-      try {
-        await brokerFetch("/unregister", { id: myId });
-        log("Unregistered from broker");
+        // Synchronous HTTP is not possible, so fire-and-forget
+        fetch(`${BROKER_URL}/unregister`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: myId }),
+        }).catch(() => {});
+        log("Unregister requested");
       } catch {
         // Best effort
       }
     }
-    process.exit(0);
   };
 
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
+  process.on("SIGINT", () => { cleanup(); process.exit(0); });
+  process.on("SIGTERM", () => { cleanup(); process.exit(0); });
   if (process.platform === "win32") {
     process.on("exit", cleanup);
   }
+
+  // 5. Kick off background init (errors are non-fatal for MCP connection)
+  backgroundInit().catch((e) => {
+    log(`Background init failed: ${e instanceof Error ? e.message : String(e)}`);
+  });
 }
 
 main().catch((e) => {
