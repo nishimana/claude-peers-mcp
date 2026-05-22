@@ -19,6 +19,10 @@ export interface Message {
   text: string;
   sent_at: string; // ISO timestamp
   delivered: boolean;
+  // FIN flag: true means "I have nothing more to say" (handoff obligation ledger).
+  // A normal message obligates the recipient to reply; a FIN message clears the
+  // sender's own obligation and creates none on the recipient. Defaults to false.
+  fin: boolean;
 }
 
 // --- Broker API types ---
@@ -56,6 +60,8 @@ export interface SendMessageRequest {
   from_id: PeerId;
   to_id: PeerId;
   text: string;
+  // Optional FIN flag (defaults to false). See Message.fin.
+  fin?: boolean;
 }
 
 export interface PollMessagesRequest {
@@ -64,4 +70,27 @@ export interface PollMessagesRequest {
 
 export interface PollMessagesResponse {
   messages: Message[];
+}
+
+// --- Read-only message log (handoff obligation ledger source) ---
+// Returns recent message metadata WITHOUT marking anything delivered.
+// The watchdog derives owes/since/chatter from this raw log (broker stays dumb).
+
+export interface MessagesLogRequest {
+  // Only return messages with sent_at strictly greater than this ISO timestamp.
+  since?: string;
+  // Hard cap on rows returned (most recent first when capped). Defaults broker-side.
+  limit?: number;
+}
+
+export interface MessageLogEntry {
+  id: number;
+  from_id: PeerId;
+  to_id: PeerId;
+  sent_at: string; // ISO timestamp
+  fin: boolean;
+}
+
+export interface MessagesLogResponse {
+  messages: MessageLogEntry[];
 }

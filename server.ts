@@ -218,6 +218,11 @@ const TOOLS = [
           type: "string" as const,
           description: "The message to send",
         },
+        fin: {
+          type: "boolean" as const,
+          description:
+            'Set true ONLY when you have nothing more to say (closing the handoff). By default every message obligates the recipient to reply; a fin message clears your own obligation and does not create one for them. Do not set fin on a message that asks something or hands off work.',
+        },
       },
       required: ["to_id", "message"],
     },
@@ -314,7 +319,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      const { to_id, message, fin } = args as { to_id: string; message: string; fin?: boolean };
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
@@ -326,6 +331,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           from_id: myId,
           to_id,
           text: message,
+          fin: fin ?? false,
         });
         if (!result.ok) {
           return {

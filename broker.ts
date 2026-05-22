@@ -19,6 +19,9 @@ import type {
   SendMessageRequest,
   PollMessagesRequest,
   PollMessagesResponse,
+  MessagesLogRequest,
+  MessagesLogResponse,
+  MessageLogEntry,
   Peer,
   Message,
 } from "./shared/types.ts";
@@ -53,10 +56,22 @@ db.run(`
     text TEXT NOT NULL,
     sent_at TEXT NOT NULL,
     delivered INTEGER NOT NULL DEFAULT 0,
+    fin INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (from_id) REFERENCES peers(id),
     FOREIGN KEY (to_id) REFERENCES peers(id)
   )
 `);
+
+// Migrate pre-existing databases: CREATE TABLE IF NOT EXISTS won't add the
+// `fin` column to a `messages` table created before this change. Add it if missing.
+function ensureColumn(table: string, column: string, ddl: string): void {
+  const cols = db.query(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) {
+    db.run(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  }
+}
+
+ensureColumn("messages", "fin", "fin INTEGER NOT NULL DEFAULT 0");
 
 // Clean up stale peers (PIDs that no longer exist) on startup
 function isProcessAlive(pid: number): boolean {
@@ -115,8 +130,8 @@ const selectPeersByGitRoot = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
-  VALUES (?, ?, ?, ?, 0)
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, fin)
+  VALUES (?, ?, ?, ?, 0, ?)
 `);
 
 const selectUndelivered = db.prepare(`
@@ -125,6 +140,18 @@ const selectUndelivered = db.prepare(`
 
 const markDelivered = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ?
+`);
+
+// Read-only ledger source: recent message metadata, newest first, optionally
+// since a timestamp. Does NOT touch `delivered` — the watchdog reads this freely.
+const selectLogSince = db.prepare(`
+  SELECT id, from_id, to_id, sent_at, fin FROM messages
+  WHERE sent_at > ? ORDER BY sent_at DESC LIMIT ?
+`);
+
+const selectLogAll = db.prepare(`
+  SELECT id, from_id, to_id, sent_at, fin FROM messages
+  ORDER BY sent_at DESC LIMIT ?
 `);
 
 // --- Generate peer ID ---
@@ -206,8 +233,31 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
 
-  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), body.fin ? 1 : 0);
   return { ok: true };
+}
+
+const DEFAULT_LOG_LIMIT = 500;
+
+function handleMessagesLog(body: MessagesLogRequest): MessagesLogResponse {
+  const limit = body.limit && body.limit > 0 ? body.limit : DEFAULT_LOG_LIMIT;
+  const rows = (body.since
+    ? selectLogSince.all(body.since, limit)
+    : selectLogAll.all(limit)) as Array<{
+    id: number;
+    from_id: string;
+    to_id: string;
+    sent_at: string;
+    fin: number;
+  }>;
+  const messages: MessageLogEntry[] = rows.map((r) => ({
+    id: r.id,
+    from_id: r.from_id,
+    to_id: r.to_id,
+    sent_at: r.sent_at,
+    fin: r.fin === 1,
+  }));
+  return { messages };
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
@@ -281,6 +331,8 @@ const server = Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/messages-log":
+          return Response.json(handleMessagesLog(body as MessagesLogRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
