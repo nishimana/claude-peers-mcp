@@ -94,3 +94,29 @@ export interface MessageLogEntry {
 export interface MessagesLogResponse {
   messages: MessageLogEntry[];
 }
+
+// --- Busy/idle state (fed by Claude Code hooks: PreToolUse=busy, Stop=idle) ---
+// Ephemeral runtime signal, kept in-memory (NOT persisted): on broker restart
+// hooks re-post on the next activity. Keyed by the peer's stable identity
+// bracket (e.g. "[role:orchestrator project:projectB]"), set per-window via the
+// CLAUDE_PEER_TAG env var so all peers in one repo (shared cwd) stay distinct.
+
+export type PeerState = "busy" | "idle";
+
+export interface SetStateRequest {
+  key: string;
+  state: PeerState;
+}
+
+export interface PeerStateEntry {
+  key: string;
+  state: PeerState;
+  // Server-stamped time the peer ENTERED the current state (for idle-duration).
+  since: string; // ISO timestamp
+  // Server-stamped time of the most recent post for this key (liveness).
+  updated_at: string; // ISO timestamp
+}
+
+export interface StatesResponse {
+  states: PeerStateEntry[];
+}

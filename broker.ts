@@ -22,6 +22,9 @@ import type {
   MessagesLogRequest,
   MessagesLogResponse,
   MessageLogEntry,
+  SetStateRequest,
+  StatesResponse,
+  PeerStateEntry,
   Peer,
   Message,
 } from "./shared/types.ts";
@@ -237,6 +240,33 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   return { ok: true };
 }
 
+// In-memory busy/idle state, keyed by CLAUDE_PEER_TAG. Intentionally NOT in
+// SQLite: this is ephemeral runtime signal — a broker restart should forget it
+// and let hooks re-post on the next activity.
+const peerStates = new Map<string, PeerStateEntry>();
+
+function handleSetState(body: SetStateRequest): { ok: boolean } {
+  const now = new Date().toISOString();
+  const prev = peerStates.get(body.key);
+  if (prev && prev.state === body.state) {
+    // Same state: keep `since` (still in it), just refresh liveness.
+    prev.updated_at = now;
+  } else {
+    // New key or a state transition: reset `since` to now.
+    peerStates.set(body.key, {
+      key: body.key,
+      state: body.state,
+      since: now,
+      updated_at: now,
+    });
+  }
+  return { ok: true };
+}
+
+function handleStates(): StatesResponse {
+  return { states: Array.from(peerStates.values()) };
+}
+
 const DEFAULT_LOG_LIMIT = 500;
 
 function handleMessagesLog(body: MessagesLogRequest): MessagesLogResponse {
@@ -333,6 +363,10 @@ const server = Bun.serve({
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/messages-log":
           return Response.json(handleMessagesLog(body as MessagesLogRequest));
+        case "/set-state":
+          return Response.json(handleSetState(body as SetStateRequest));
+        case "/states":
+          return Response.json(handleStates());
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
